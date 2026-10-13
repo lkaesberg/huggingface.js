@@ -541,6 +541,36 @@ test("headers reach where a layer redirects on the root origin, and never anothe
 	const elsewhere = log.filter(([host]) => host === "other");
 	assert.ok(elsewhere.length > 0 && elsewhere.every(([, , auth]) => auth === null), JSON.stringify(log));
 });
+test("headers reach where the root redirects on its own origin, once it has been followed without them", async () => {
+	const log = [];
+	const site = http.createServer((req, res) => {
+		log.push([req.url, req.headers.authorization ?? null]);
+		if (req.url === "/root.usda") return res.writeHead(302, { location: "/v2/root.usda" }).end();
+		if (req.url === "/v2/root.usda" && req.headers.authorization === "Bearer SECRET")
+			return res.end(`#usda 1.0\n${QUAD}`);
+		res.writeHead(401).end();
+	});
+	await new Promise((resolve) => site.listen(0, "127.0.0.1", resolve));
+	cleanups.push(() => site.close());
+	const rootUrl = `http://127.0.0.1:${site.address().port}/root.usda`;
+	const policyOf = (url) => requestPolicy(url, rootUrl);
+	const headers = { Authorization: "Bearer SECRET" };
+	const { scene, stats } = await composeStage({
+		UsdLoader,
+		fetchBytes: (url, budget) =>
+			fetchLimited(url, budget, { fetchFn: (target) => fetchWithPolicy(target, policyOf(target), headers, policyOf) }),
+		rootUrl,
+	});
+	scene.free();
+	assert.deepEqual(stats.warnings, []);
+	// Sent, not followed; followed without the headers; then fetched with them where it landed.
+	assert.deepEqual(log, [
+		["/root.usda", "Bearer SECRET"],
+		["/root.usda", null],
+		["/v2/root.usda", null],
+		["/v2/root.usda", "Bearer SECRET"],
+	]);
+});
 test("a packaged image shared by many materials is extracted once, and only when its texture mode loads it", async () => {
 	// Two materials each sample one 1 MiB image twice.
 	const materials = Array.from(

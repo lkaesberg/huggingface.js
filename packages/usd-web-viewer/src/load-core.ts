@@ -749,7 +749,7 @@ function credentialed(target: URL, root: URL) {
  * hosts), it is not followed, and the URL is fetched again without headers or
  * cookies, for the browser to follow. Where that lands is then known: if
  * `policyOf` still allows credentials there (a redirect within the root's own
- * origin), it is fetched once more with the headers.
+ * origin), it is fetched once more with the headers, without following again.
  */
 export async function fetchWithPolicy(
 	url: string,
@@ -775,7 +775,7 @@ export async function fetchWithPolicy(
 		return followed;
 	}
 	followed.body?.cancel().catch(() => {});
-	return fetchWithPolicy(followed.url, landed, headers, policyOf);
+	return fetchWithPolicy(followed.url, landed, headers);
 }
 
 /**

@@ -55,7 +55,7 @@ export interface LoadOptions {
 	 * only http(s) URLs without user names; hf.co URLs are fetched (and checked) as the huggingface.co URLs they redirect to; on huggingface.co,
 	 * only repo files (`…/resolve/…`) and tree listings under a user or organization, with no encoded slash outside the revision (a pull
 	 * request's `refs%2Fpr%2F1`); cookies and `headers` only for the root's origin or, for a Hub root, the root's own repo; no referrer. Only the
-	 * requested URL is checked, not where it redirects (`headers` never follow a redirect off the Hub). Anything refused is skipped with a
+	 * requested URL is checked, not where it redirects (off the Hub, `headers` follow a redirect only within the root's origin). Anything refused is skipped with a
 	 * `layer-missing` or `texture-failed` warning.
 	 */
 	allowedOrigins?: readonly string[] | undefined;
