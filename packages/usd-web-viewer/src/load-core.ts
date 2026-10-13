@@ -747,12 +747,15 @@ function credentialed(target: URL, root: URL) {
  * only where credentials may go. A request carrying them does not follow a
  * redirect with them: unless it is on the Hub (whose redirects stay on its own
  * hosts), it is not followed, and the URL is fetched again without headers or
- * cookies, for the browser to follow.
+ * cookies, for the browser to follow. Where that lands is then known: if
+ * `policyOf` still allows credentials there (a redirect within the root's own
+ * origin), it is fetched once more with the headers.
  */
 export async function fetchWithPolicy(
 	url: string,
 	policy: AllowedRequest,
 	headers: Record<string, string> | undefined,
+	policyOf?: (url: string) => RequestPolicy,
 ): Promise<Response> {
 	const sendHeaders = policy.credentials === "same-origin" && !!headers && Object.keys(headers).length > 0;
 	if (!sendHeaders) {
@@ -766,7 +769,13 @@ export async function fetchWithPolicy(
 		return response;
 	}
 	response.body?.cancel().catch(() => {});
-	return fetch(url, { ...policy, credentials: "omit" });
+	const followed = await fetch(url, { ...policy, credentials: "omit" });
+	const landed = followed.redirected ? policyOf?.(followed.url) : undefined;
+	if (!landed || landed.refused !== undefined || landed.credentials !== "same-origin") {
+		return followed;
+	}
+	followed.body?.cancel().catch(() => {});
+	return fetchWithPolicy(followed.url, landed, headers, policyOf);
 }
 
 /**

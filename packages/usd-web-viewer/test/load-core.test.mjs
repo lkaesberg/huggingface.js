@@ -8,11 +8,13 @@ import { initSync, UsdLoader } from "../wasm/usd_wasm.js";
 import {
 	composeStage,
 	fetchLimited,
+	fetchWithPolicy,
 	imageInfo,
 	loadFailure,
 	localResponse,
 	localUrl,
 	readGeometries,
+	requestPolicy,
 	takePackagedTextures,
 	textureJobs,
 } from "../src/load-core.ts";
@@ -496,6 +498,48 @@ test("relative layers resolve against the requested URL, not where it redirected
 	const { scene } = await composeStage({ UsdLoader, fetchBytes: fetchLimited, rootUrl: `${base}/a/root.usda` });
 	scene.free();
 	assert.deepEqual(requested, ["/a/root.usda", "/cdn/blob1", "/a/sub.usda"]);
+});
+test("headers reach where a layer redirects on the root origin, and never another origin", async () => {
+	const log = [];
+	const other = http.createServer((req, res) => {
+		log.push(["other", req.url, req.headers.authorization ?? null]);
+		res.end(`#usda 1.0\n${QUAD}`);
+	});
+	await new Promise((resolve) => other.listen(0, "127.0.0.1", resolve));
+	cleanups.push(() => other.close());
+	const site = http.createServer((req, res) => {
+		log.push(["site", req.url, req.headers.authorization ?? null]);
+		if (req.url === "/root.usda") return res.end(sublayers("./a.usda", "./b.usda"));
+		if (req.url === "/a.usda") return res.writeHead(302, { location: "/v2/a.usda" }).end();
+		if (req.url === "/v2/a.usda") {
+			if (req.headers.authorization !== "Bearer SECRET") return res.writeHead(401).end();
+			return res.end(`#usda 1.0\n${QUAD}`);
+		}
+		if (req.url === "/b.usda") {
+			return res.writeHead(302, { location: `http://127.0.0.1:${other.address().port}/b.usda` }).end();
+		}
+		res.writeHead(404).end();
+	});
+	await new Promise((resolve) => site.listen(0, "127.0.0.1", resolve));
+	cleanups.push(() => site.close());
+	const rootUrl = `http://127.0.0.1:${site.address().port}/root.usda`;
+	const policyOf = (url) => requestPolicy(url, rootUrl, ["*"]);
+	const headers = { Authorization: "Bearer SECRET" };
+	const { scene, stats } = await composeStage({
+		UsdLoader,
+		fetchBytes: (url, budget) =>
+			fetchLimited(url, budget, { fetchFn: (target) => fetchWithPolicy(target, policyOf(target), headers, policyOf) }),
+		rootUrl,
+	});
+	scene.free();
+	assert.deepEqual(stats.warnings, []);
+	// Followed once without the headers, then fetched where it landed with them.
+	assert.deepEqual(
+		log.filter(([, url]) => url === "/v2/a.usda").map(([, , auth]) => auth),
+		[null, "Bearer SECRET"],
+	);
+	const elsewhere = log.filter(([host]) => host === "other");
+	assert.ok(elsewhere.length > 0 && elsewhere.every(([, , auth]) => auth === null), JSON.stringify(log));
 });
 test("a packaged image shared by many materials is extracted once, and only when its texture mode loads it", async () => {
 	// Two materials each sample one 1 MiB image twice.

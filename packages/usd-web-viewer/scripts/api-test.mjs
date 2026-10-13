@@ -87,7 +87,14 @@ test("headers never follow a redirect to another origin", async () => {
 		'#usda 1.0\ndef Mesh "M" {\n  int[] faceVertexCounts = [3]\n  int[] faceVertexIndices = [0, 1, 2]\n  point3f[] points = [(0, 0, 0), (1, 0, 0), (0, 1, 0)]\n}';
 	const other = await loggingServer((req, res, cors) => res.writeHead(200, cors).end(quad));
 	const site = await loggingServer((req, res, cors) => {
-		if (req.url === "/root.usda") return res.writeHead(200, cors).end("#usda 1.0\n(subLayers = [@./a.usda@])");
+		if (req.url === "/root.usda")
+			return res.writeHead(200, cors).end("#usda 1.0\n(subLayers = [@./a.usda@, @./b.usda@])");
+		// A redirect within the root's origin: the headers reach where it lands.
+		if (req.url === "/b.usda") return res.writeHead(302, { ...cors, location: "/c.usda" }).end();
+		if (req.url === "/c.usda") {
+			if (req.headers.authorization !== "Bearer SECRET") return res.writeHead(401, cors).end();
+			return res.writeHead(200, cors).end(quad.replace('"M"', '"N"'));
+		}
 		res.writeHead(302, { ...cors, location: `${other.origin}/a.usda` }).end();
 	});
 	const meshes = await page.evaluate(
@@ -109,10 +116,14 @@ test("headers never follow a redirect to another origin", async () => {
 		`headers reach the root origin: ${JSON.stringify(site.log)}`,
 	);
 	assert.ok(
+		site.log.some(([url, key, auth]) => url === "/c.usda" && key === "SECRET2" && auth === "Bearer SECRET"),
+		`headers reach a redirect's target on the root origin: ${JSON.stringify(site.log)}`,
+	);
+	assert.ok(
 		other.log.length > 0 && other.log.every(([, key, auth]) => key === null && auth === null),
 		JSON.stringify(other.log),
 	);
-	assert.equal(meshes, 1);
+	assert.equal(meshes, 2);
 });
 
 test("headers reach the layers and textures on the root origin, and no other origin", async () => {

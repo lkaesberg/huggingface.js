@@ -65,7 +65,9 @@ self.onmessage = async ({ data }) => {
 		if (target.startsWith(LOCAL)) {
 			return localResponse(files, target);
 		}
-		return fetchWithPolicy(target, policy, headers);
+		return fetchWithPolicy(target, policy, headers, (landed) =>
+			requestPolicy(canonicalUrl(landed), url, allowedOrigins),
+		);
 	};
 	const fetchBytes = (target: string, budget: Budget) => fetchLimited(target, budget, { fetchFn: request });
 	// One budget for every texture, packaged ones first, then each fetched

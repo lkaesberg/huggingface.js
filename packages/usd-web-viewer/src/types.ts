@@ -34,7 +34,8 @@ export interface LoadOptions {
 	/**
 	 * Sent only with the requests that carry credentials: those to the root URL's origin or, for a root on the Hugging Face Hub, to the root's own repo.
 	 * For embedding on another site, e.g. `{ Authorization: 'Bearer hf_…' }`. Never sent through a redirect: off the Hub (whose redirects stay on
-	 * its own hosts), a request that redirects is fetched again without headers or cookies, for the browser to follow.
+	 * its own hosts), a request that redirects is fetched again without headers or cookies, for the browser to follow; where it lands, if
+	 * still on the root's origin, is then fetched with them.
 	 */
 	headers?: Record<string, string> | undefined;
 	onProgress?: ((progress: LoadProgress) => void) | undefined;
