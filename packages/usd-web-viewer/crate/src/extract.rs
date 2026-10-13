@@ -348,6 +348,7 @@ pub fn plan(stage: &Stage, max_instances: usize) -> openusd::Result<Scene> {
 
     // Visibility and purpose first: an invisible or guide instancer places nothing.
     let mut instancers = Vec::new();
+    let mut drawable = Vec::new();
     for path in &paths {
         let prim = stage.prim(path)?;
         let mut own = path
@@ -365,8 +366,16 @@ pub fn plan(stage: &Stage, max_instances: usize) -> openusd::Result<Scene> {
             own.hidden_purpose = purpose == "guide" || purpose == "proxy";
         }
         state.insert(path.clone(), own);
-        if prim.type_name()?.as_deref() == Some("PointInstancer") {
-            instancers.push((prim, own.invisible || own.hidden_purpose));
+        match prim.type_name()?.as_deref() {
+            Some("PointInstancer") => instancers.push((prim, own.invisible || own.hidden_purpose)),
+            Some(ty)
+                if (ty == "Mesh" || implicit::is_implicit(ty))
+                    && !own.invisible
+                    && !own.hidden_purpose =>
+            {
+                drawable.push(path.clone())
+            }
+            _ => {}
         }
     }
 
@@ -392,6 +401,16 @@ pub fn plan(stage: &Stage, max_instances: usize) -> openusd::Result<Scene> {
             indices.push(index);
         }
         targets.push(indices);
+    }
+    // The meshes drawn at each placement of a prototype: a placed copy draws
+    // all of them or, past maxInstances, none.
+    let mut meshes_in = vec![0usize; prototypes.len()];
+    for path in &drawable {
+        if let Some(p) = std::iter::successors(Some(path.clone()), |p| p.parent())
+            .find_map(|p| prototype_index.get(&p).copied())
+        {
+            meshes_in[p as usize] += 1;
+        }
     }
     let instancers = instancers
         .into_iter()
@@ -426,6 +445,10 @@ pub fn plan(stage: &Stage, max_instances: usize) -> openusd::Result<Scene> {
         ..
     } = placer;
     let mut over_limit: Option<String> = None;
+    // Instances drawn or set aside for the rest of a prototype's meshes, and
+    // the copies drawn of each prototype, fixed at its first mesh.
+    let mut used = 0usize;
+    let mut copies: HashMap<u32, usize> = HashMap::new();
 
     for path in paths {
         let prim = stage.prim(&path)?;
@@ -461,11 +484,24 @@ pub fn plan(stage: &Stage, max_instances: usize) -> openusd::Result<Scene> {
             scene.stats.skipped_purpose += 1;
             continue;
         }
-        let remaining = max_instances.saturating_sub(scene.instances.len());
         let placements = own.prototype.map(|p| &prototypes[p as usize].placements);
-        if remaining < placements.map_or(1, Vec::len) {
+        let count = match own.prototype {
+            Some(p) => *copies.entry(p).or_insert_with(|| {
+                let meshes = meshes_in[p as usize].max(1);
+                let fit = max_instances.saturating_sub(used) / meshes;
+                let count = placements.map_or(0, Vec::len).min(fit);
+                used += count * meshes;
+                count
+            }),
+            None => {
+                let fit = usize::from(used < max_instances);
+                used += fit;
+                fit
+            }
+        };
+        if count < placements.map_or(1, Vec::len) {
             over_limit.get_or_insert_with(|| path.as_str().to_owned());
-            if remaining == 0 {
+            if count == 0 {
                 continue;
             }
         }
@@ -542,7 +578,7 @@ pub fn plan(stage: &Stage, max_instances: usize) -> openusd::Result<Scene> {
                     .unwrap_or((Matrix4d::IDENTITY, false));
                 placements
                     .iter()
-                    .take(remaining)
+                    .take(count)
                     .map(|(label, placement)| {
                         (format!("{}{label}", path.as_str()), to_root * *placement)
                     })
