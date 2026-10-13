@@ -80,6 +80,19 @@ async function routeTextured(root, texture) {
 	await page.context().route(root, (route) => route.fulfill({ body: usda, contentType: "text/plain" }));
 }
 
+/** Installs window.describeImage, which counts the drawn (non-transparent) pixels of an image blob. */
+function installDescribeImage() {
+	window.describeImage = async (blob) => {
+		const bitmap = await createImageBitmap(blob);
+		const ctx = new OffscreenCanvas(bitmap.width, bitmap.height).getContext("2d");
+		ctx.drawImage(bitmap, 0, 0);
+		const { data } = ctx.getImageData(0, 0, bitmap.width, bitmap.height);
+		let drawn = 0;
+		for (let i = 3; i < data.length; i += 4) if (data[i]) drawn++;
+		return { type: blob.type, width: bitmap.width, height: bitmap.height, drawn: drawn > 100 };
+	};
+}
+
 test("headers never follow a redirect to another origin", async () => {
 	// Three origins, as when a page loads from a CDN: the page's, the root's, and another that a layer on the
 	// root's origin redirects to. First, before any Playwright route: routing changes how redirects are followed.
@@ -262,6 +275,207 @@ test("abort rejects with an aborted UsdLoadError, before or during the load", as
 	await held?.abort();
 	await page.context().unroute("**/__pending.usda");
 	assert.deepEqual(outcomes, ["UsdLoadError:aborted", "UsdLoadError:aborted"]);
+});
+
+test("lifecycle: a newer load wins; stopping a load stops all of it, while WASM compiles and as meshes stream in", async () => {
+	let held;
+	await page.context().route("**/__hang.wasm", (route) => (held = route));
+	const out = await page.evaluate(
+		async ([module, shapes, textured]) => {
+			const settle = (promise) =>
+				Promise.race([
+					promise.then(
+						() => "resolved",
+						(e) => e.code,
+					),
+					new Promise((resolve) => setTimeout(() => resolve("hung"), 3000)),
+				]);
+			// A fresh copy of the module, its WASM compile never finishing.
+			const fresh = await import(`${module}?compiling`);
+			const compiling = new AbortController();
+			const whileCompiling = fresh.loadUsd(shapes, { signal: compiling.signal, wasmUrl: "/__hang.wasm" });
+			const compilingOutcome = settle(whileCompiling);
+			setTimeout(() => compiling.abort(), 50);
+
+			const { createViewer } = await import(module);
+			const host = document.body.appendChild(document.createElement("div"));
+			host.style.cssText = "width:200px;height:150px";
+			const viewer = createViewer(host);
+			const shown = () => viewer.scene.children.filter((c) => c.name === "usd").length;
+
+			// Overlapping loads: the older is discarded.
+			const first = viewer.load(shapes).then(
+				() => "resolved",
+				(e) => e.code,
+			);
+			const second = await viewer.load(textured);
+			const overlapping = {
+				first: await first,
+				shown: shown(),
+				secondShown: viewer.scene.children.includes(second.root),
+			};
+
+			let streaming;
+			const streamed = new Promise((resolve) => (streaming = resolve));
+			const cleared = viewer.load(shapes, {
+				textures: "none",
+				onProgress: (p) => p.stage === "geometry" && streaming(),
+			});
+			await streamed;
+			const before = shown();
+			viewer.clear();
+			const afterClear = shown();
+			const outcomes = { compiling: await compilingOutcome, cleared: await settle(cleared) };
+			await new Promise((resolve) => setTimeout(resolve, 300));
+			const later = shown();
+			viewer.dispose();
+			viewer.dispose();
+			const canvasRemoved = !host.querySelector("canvas");
+			host.remove();
+			return { overlapping, outcomes, shown: [before, afterClear, later], canvasRemoved };
+		},
+		[MODULE, SHAPES, TEXTURED],
+	);
+	await held?.abort();
+	await page.context().unroute("**/__hang.wasm");
+	assert.deepEqual(
+		out,
+		{
+			overlapping: { first: "aborted", shown: 1, secondShown: true },
+			outcomes: { compiling: "aborted", cleared: "aborted" },
+			shown: [1, 0, 0],
+			canvasRemoved: true,
+		},
+		JSON.stringify(out),
+	);
+});
+
+test("many instances of one mesh render as one InstancedMesh", async () => {
+	await page.evaluate(installDescribeImage);
+	const out = await page.evaluate(
+		async ([module, url]) => {
+			const { createViewer } = await import(module);
+			const host = document.body.appendChild(document.createElement("div"));
+			host.style.cssText = "width:200px;height:150px";
+			const viewer = createViewer(host);
+			const result = await viewer.load(url);
+			const meshes = result.root.children.map((m) => [m.isInstancedMesh ?? false, m.count ?? 1]);
+			const image = await window.describeImage(await viewer.toBlob());
+			viewer.dispose();
+			host.remove();
+			return { meshes, instances: result.info.meshes, drawn: image.drawn };
+		},
+		[MODULE, "/fixtures/nested_instancers.usda"],
+	);
+	assert.deepEqual(out, { meshes: [[true, 6]], instances: 6, drawn: true });
+});
+
+test("toBlob captures a freshly rendered frame, as PNG or WebP, at the canvas size or a given one", async () => {
+	await page.evaluate(installDescribeImage);
+	const shots = await page.evaluate(
+		async ([module, url]) => {
+			const { createViewer } = await import(module);
+			const describe = window.describeImage;
+			const host = document.body.appendChild(document.createElement("div"));
+			host.style.cssText = "width:320px;height:240px";
+			const viewer = createViewer(host);
+			await viewer.load(url, { textures: "none" });
+			const canvas = viewer.renderer.domElement;
+			// Long after the last frame: only a fresh render has pixels to read.
+			await new Promise((resolve) => setTimeout(resolve, 500));
+			const full = await describe(await viewer.toBlob());
+			const thumb = await describe(await viewer.toBlob({ type: "image/webp", width: 64, height: 48 }));
+			const wide = await describe(await viewer.toBlob({ width: 100 }));
+			const size = [canvas.width, canvas.height];
+			viewer.dispose();
+			const disposed = await viewer.toBlob().then(
+				() => "resolved",
+				(e) => e.message,
+			);
+			host.remove();
+			return { full, thumb, wide, disposed, canvas: size };
+		},
+		[MODULE, SHAPES],
+	);
+	assert.deepEqual(shots.full, { type: "image/png", width: shots.canvas[0], height: shots.canvas[1], drawn: true });
+	assert.deepEqual(shots.thumb, { type: "image/webp", width: 64, height: 48, drawn: true });
+	assert.deepEqual(shots.wide, {
+		type: "image/png",
+		width: 100,
+		height: Math.round((100 * shots.canvas[1]) / shots.canvas[0]),
+		drawn: true,
+	});
+	assert.match(shots.disposed, /no frame to capture/);
+});
+
+test("a lost WebGL context drops the stage and calls onContextLost; once restored, onContextRestored gets the reload", async () => {
+	const out = await page.evaluate(
+		async ([module, url]) => {
+			const { createViewer } = await import(module);
+			const until = async (predicate) => {
+				for (let i = 0; i < 500 && !predicate(); i++) await new Promise((resolve) => setTimeout(resolve, 20));
+			};
+			const host = document.body.appendChild(document.createElement("div"));
+			host.style.cssText = "width:200px;height:150px";
+			const events = [];
+			let reload;
+			const viewer = createViewer(host, {
+				onContextLost: () => events.push("lost"),
+				onContextRestored: (promise) => (
+					events.push(promise ? "restored with a reload" : "restored"), (reload = promise)
+				),
+			});
+			await viewer.load(url, { textures: "none" });
+			const lose = viewer.renderer.getContext().getExtension("WEBGL_lose_context");
+			lose.loseContext();
+			await until(() => events.includes("lost"));
+			const lost = { stage: !!viewer.scene.getObjectByName("usd") };
+			lose.restoreContext();
+			await until(() => events.length === 2);
+			const again = await reload;
+			const restored = { triangles: again.info.triangles, shown: viewer.scene.children.includes(again.root) };
+			viewer.dispose();
+			host.remove();
+			return { events, lost, restored };
+		},
+		[MODULE, SHAPES],
+	);
+	assert.deepEqual(out, {
+		events: ["lost", "restored with a reload"],
+		lost: { stage: false },
+		restored: { triangles: 3304, shown: true },
+	});
+});
+
+test("the focused canvas zooms in with + and out with -, from the keyboard", async () => {
+	await page.evaluate(
+		async ([module, url]) => {
+			const { createViewer } = await import(module);
+			const host = document.body.appendChild(document.createElement("div"));
+			host.style.cssText = "width:200px;height:150px";
+			window.zoomViewer = createViewer(host);
+			window.zoomHost = host;
+			await window.zoomViewer.load(url, { textures: "none" });
+		},
+		[MODULE, SHAPES],
+	);
+	// The canvas is focusable: Tab reaches it, with a visible focus ring.
+	await page.keyboard.press("Tab");
+	const distance = () => page.evaluate(() => window.zoomViewer.controls.getDistance());
+	const before = await distance();
+	await page.keyboard.press("+");
+	const closer = await distance();
+	await page.keyboard.press("-");
+	await page.keyboard.press("-");
+	const farther = await distance();
+	const focused = await page.evaluate(() => {
+		const focused = window.zoomViewer.renderer.domElement.matches(":focus-visible");
+		window.zoomViewer.dispose();
+		window.zoomHost.remove();
+		return focused;
+	});
+	assert.ok(closer < before && farther > before, `${before} -> ${closer} -> ${farther}`);
+	assert.equal(focused, true);
 });
 
 /** Loads `root` from `files` (`{ key: text, or '/fixtures/…' to copy a served file }`) with `options`, logging only the requests made during the load. */
