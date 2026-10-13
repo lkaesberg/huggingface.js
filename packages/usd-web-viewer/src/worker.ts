@@ -11,9 +11,9 @@ import {
 	fetchLimited,
 	fetchWithPolicy,
 	imageInfo,
-	keyOfLocalUrl,
 	limiter,
 	loadFailure,
+	localResponse,
 	readGeometries,
 	requestPolicy,
 	takePackagedTextures,
@@ -63,8 +63,7 @@ self.onmessage = async ({ data }) => {
 			throw new TypeError(`request refused: ${policy.refused}`);
 		}
 		if (target.startsWith(LOCAL)) {
-			const file = files?.get(keyOfLocalUrl(target));
-			return file ? new Response(file) : new Response(null, { status: 404 });
+			return localResponse(files, target);
 		}
 		return fetchWithPolicy(target, policy, headers);
 	};
