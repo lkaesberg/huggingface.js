@@ -408,7 +408,7 @@ test("toBlob captures a freshly rendered frame, as PNG or WebP, at the canvas si
 	assert.match(shots.disposed, /no frame to capture/);
 });
 
-test("a lost WebGL context drops the stage and calls onContextLost; once restored, onContextRestored reloads the last stage that loaded", async () => {
+test("a lost WebGL context drops the stage and calls onContextLost; once restored, onContextRestored reloads the last stage shown", async () => {
 	const out = await page.evaluate(
 		async ([module, url]) => {
 			const { createViewer } = await import(module);
@@ -454,6 +454,41 @@ test("a lost WebGL context drops the stage and calls onContextLost; once restore
 		lost: { stage: false },
 		restored: { triangles: 3304, shown: true },
 	});
+});
+
+test("a context lost while a stage streams in reloads that stage once restored", async () => {
+	const out = await page.evaluate(
+		async ([module, first, second]) => {
+			const { createViewer } = await import(module);
+			const host = document.body.appendChild(document.createElement("div"));
+			host.style.cssText = "width:200px;height:150px";
+			let reload;
+			const viewer = createViewer(host, { onContextRestored: (promise) => (reload = promise) });
+			const canvas = viewer.renderer.domElement;
+			const shown = (await viewer.load(second, { textures: "none" })).info.triangles;
+			await viewer.load(first, { textures: "none" });
+			// The context events, dispatched as the second stage shows: a real loss arrives a task later, when this
+			// small stage may have finished loading.
+			let lost = false;
+			const streaming = await viewer
+				.load(second, {
+					textures: "none",
+					onProgress: ({ stage }) =>
+						stage === "geometry" && !lost && ((lost = true), canvas.dispatchEvent(new Event("webglcontextlost"))),
+				})
+				.then(
+					() => "loaded",
+					(error) => error.code,
+				);
+			canvas.dispatchEvent(new Event("webglcontextrestored"));
+			const again = await reload;
+			viewer.dispose();
+			host.remove();
+			return { streaming, reloaded: again.info.triangles === shown };
+		},
+		[MODULE, SHAPES, TEXTURED],
+	);
+	assert.deepEqual(out, { streaming: "aborted", reloaded: true }, JSON.stringify(out));
 });
 
 test("the focused canvas zooms in with + and out with -, from the keyboard", async () => {
