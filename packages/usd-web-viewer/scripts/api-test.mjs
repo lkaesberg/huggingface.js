@@ -408,7 +408,7 @@ test("toBlob captures a freshly rendered frame, as PNG or WebP, at the canvas si
 	assert.match(shots.disposed, /no frame to capture/);
 });
 
-test("a lost WebGL context drops the stage and calls onContextLost; once restored, onContextRestored gets the reload", async () => {
+test("a lost WebGL context drops the stage and calls onContextLost; once restored, onContextRestored reloads the last stage that loaded", async () => {
 	const out = await page.evaluate(
 		async ([module, url]) => {
 			const { createViewer } = await import(module);
@@ -429,6 +429,11 @@ test("a lost WebGL context drops the stage and calls onContextLost; once restore
 			const first = new AbortController();
 			await viewer.load(url, { textures: "none", signal: first.signal });
 			first.abort();
+			// A load that fails is not the one reloaded.
+			const failed = await viewer.load("/fixtures/__missing.usda").then(
+				() => "loaded",
+				(error) => error.code,
+			);
 			const lose = viewer.renderer.getContext().getExtension("WEBGL_lose_context");
 			lose.loseContext();
 			await until(() => events.includes("lost"));
@@ -439,11 +444,12 @@ test("a lost WebGL context drops the stage and calls onContextLost; once restore
 			const restored = { triangles: again.info.triangles, shown: viewer.scene.children.includes(again.root) };
 			viewer.dispose();
 			host.remove();
-			return { events, lost, restored };
+			return { failed, events, lost, restored };
 		},
 		[MODULE, SHAPES],
 	);
 	assert.deepEqual(out, {
+		failed: "fetch",
 		events: ["lost", "restored with a reload"],
 		lost: { stage: false },
 		restored: { triangles: 3304, shown: true },
